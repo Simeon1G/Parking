@@ -1,4 +1,4 @@
-import { createClient } from "@vercel/kv";
+import { Redis } from "@upstash/redis";
 import type { CarId, Positions } from "./parking-shared";
 import {
   DEFAULT_POSITIONS,
@@ -20,24 +20,29 @@ export function isKvConfigured(): boolean {
   return !!(redisUrl()?.length && redisToken()?.length);
 }
 
-function getKv() {
-  const url = redisUrl();
-  const token = redisToken();
-  if (!url || !token) return null;
-  return createClient({ url, token });
+let redisSingleton: Redis | null = null;
+
+function getRedis(): Redis | null {
+  if (!isKvConfigured()) return null;
+  if (!redisSingleton) {
+    redisSingleton = Redis.fromEnv();
+  }
+  return redisSingleton;
 }
 
 export async function readPositions(): Promise<Positions> {
-  const kv = getKv();
-  if (!kv) {
+  const redis = getRedis();
+  if (!redis) {
     throw new Error("KV not configured");
   }
-  const raw = await kv.get<string>(KV_KEY);
+  const raw = await redis.get<string | Record<string, unknown>>(KV_KEY);
   if (raw == null || raw === "") {
     return DEFAULT_POSITIONS;
   }
   try {
-    const parsed = parsePositionsJson(JSON.parse(raw) as unknown);
+    const obj: unknown =
+      typeof raw === "string" ? JSON.parse(raw) : raw;
+    const parsed = parsePositionsJson(obj);
     return parsed ?? DEFAULT_POSITIONS;
   } catch {
     return DEFAULT_POSITIONS;
@@ -49,8 +54,8 @@ export async function writePosition(
   lat: number,
   lng: number,
 ): Promise<Positions> {
-  const kv = getKv();
-  if (!kv) {
+  const redis = getRedis();
+  if (!redis) {
     throw new Error("KV not configured");
   }
   const current = await readPositions();
@@ -58,6 +63,6 @@ export async function writePosition(
     ...current,
     [role]: clampToMladost2({ lat, lng }),
   };
-  await kv.set(KV_KEY, JSON.stringify(next));
+  await redis.set(KV_KEY, JSON.stringify(next));
   return next;
 }

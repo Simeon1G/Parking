@@ -101,10 +101,6 @@ function carIcon(src: string) {
   });
 }
 
-function otherRole(r: CarId): CarId {
-  return r === "me" ? "partner" : "me";
-}
-
 function resolveInitialRole(): CarId {
   if (typeof window === "undefined") return "me";
   try {
@@ -191,11 +187,14 @@ function ParkingMapLeafletInner() {
           positions?: Positions;
         };
         if (!res.ok || !data.ok || !data.positions) return;
-        const other = otherRole(roleRef.current);
-        setPositions((prev) => ({
-          ...prev,
-          [other]: data.positions![other],
-        }));
+        const server = data.positions;
+        setPositions((prev) => {
+          if (draggingRef.current) {
+            const r = roleRef.current;
+            return { ...server, [r]: prev[r] };
+          }
+          return server;
+        });
       } catch {
         /* ignore */
       }
