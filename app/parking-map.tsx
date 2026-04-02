@@ -56,6 +56,15 @@ const CAR_PHOTO: Record<CarId, { src: string }> = {
   partner: { src: "/car-partner.png" },
 };
 
+const FETCH_POSITIONS: RequestInit = {
+  cache: "no-store",
+  headers: {
+    Accept: "application/json",
+    "Cache-Control": "no-cache",
+    Pragma: "no-cache",
+  },
+};
+
 function readStoredPositions(): Positions {
   if (typeof window === "undefined") return DEFAULT_POSITIONS;
   try {
@@ -158,7 +167,7 @@ function ParkingMapLeafletInner() {
     let cancelled = false;
     (async () => {
       try {
-        const res = await fetch("/api/positions", { cache: "no-store" });
+        const res = await fetch("/api/positions", FETCH_POSITIONS);
         const data = (await res.json()) as {
           ok?: boolean;
           positions?: Positions;
@@ -179,9 +188,8 @@ function ParkingMapLeafletInner() {
   useEffect(() => {
     if (!syncEnabled) return;
     const t = window.setInterval(async () => {
-      if (draggingRef.current) return;
       try {
-        const res = await fetch("/api/positions", { cache: "no-store" });
+        const res = await fetch("/api/positions", FETCH_POSITIONS);
         const data = (await res.json()) as {
           ok?: boolean;
           positions?: Positions;
@@ -198,7 +206,7 @@ function ParkingMapLeafletInner() {
       } catch {
         /* ignore */
       }
-    }, 2500);
+    }, 2000);
     return () => clearInterval(t);
   }, [syncEnabled]);
 
@@ -210,27 +218,33 @@ function ParkingMapLeafletInner() {
     }
   }, [positions]);
 
-  const persistServer = useCallback(
-    async (car: CarId, next: LatLng) => {
-      try {
-        const res = await fetch("/api/positions", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            role: car,
-            lat: next.lat,
-            lng: next.lng,
-          }),
-        });
-        if (res.ok) {
-          setSyncEnabled(true);
-        }
-      } catch {
-        /* ignore */
+  const persistServer = useCallback(async (car: CarId, next: LatLng) => {
+    try {
+      const res = await fetch("/api/positions", {
+        method: "POST",
+        ...FETCH_POSITIONS,
+        headers: {
+          ...FETCH_POSITIONS.headers,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          role: car,
+          lat: next.lat,
+          lng: next.lng,
+        }),
+      });
+      const data = (await res.json()) as {
+        ok?: boolean;
+        positions?: Positions;
+      };
+      if (res.ok && data.ok && data.positions) {
+        setPositions(data.positions);
+        setSyncEnabled(true);
       }
-    },
-    [],
-  );
+    } catch {
+      /* ignore */
+    }
+  }, []);
 
   const onDragStart = useCallback(() => {
     draggingRef.current = true;
