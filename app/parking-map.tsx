@@ -1,56 +1,31 @@
 "use client";
 
 import Image from "next/image";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { usePathname, useSearchParams } from "next/navigation";
+import {
+  Suspense,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { MapContainer, Marker, TileLayer } from "react-leaflet";
 import L from "leaflet";
 import "leaflet/dist/leaflet.css";
-
-type CarId = "me" | "partner";
-
-const STORAGE_KEY_V2 = "parking-map-positions-v2";
-const STORAGE_KEY_V1 = "parking-map-positions-v1";
-
-/** Mladost 2, Sofia — panning is limited to this rectangle. */
-const MLADOST2_BOUNDS = {
-  north: 42.6485,
-  south: 42.6355,
-  east: 23.392,
-  west: 23.362,
-} as const;
-
-/** Where the map first opens — starts at max zoom so the area is as large as allowed. */
-const MAP_INITIAL_CENTER: [number, number] = [42.6449934, 23.3715953];
-const MAP_MIN_ZOOM = 16;
-const MAP_MAX_ZOOM = 19;
-const MAP_INITIAL_ZOOM = MAP_MAX_ZOOM;
-
-const MLADOST2_MAX_BOUNDS: L.LatLngBoundsExpression = [
-  [MLADOST2_BOUNDS.south, MLADOST2_BOUNDS.west],
-  [MLADOST2_BOUNDS.north, MLADOST2_BOUNDS.east],
-];
-
-type LatLng = { lat: number; lng: number };
-type Positions = Record<CarId, LatLng>;
-
-/** Default pins near the initial view (slightly offset so both stay visible). */
-const DEFAULT_POSITIONS: Positions = {
-  me: { lat: 42.64485, lng: 23.3714 },
-  partner: { lat: 42.64512, lng: 23.3718 },
-};
+import {
+  DEFAULT_POSITIONS,
+  MLADOST2_BOUNDS,
+  ROLE_STORAGE_KEY,
+  STORAGE_KEY_V1,
+  STORAGE_KEY_V2,
+  type CarId,
+  type LatLng,
+  type Positions,
+  clampToMladost2,
+} from "@/lib/parking-shared";
 
 type LegacyPercentPositions = Record<CarId, { x: number; y: number }>;
-
-function clamp(n: number, min: number, max: number) {
-  return Math.min(max, Math.max(min, n));
-}
-
-function clampToMladost2(p: LatLng): LatLng {
-  return {
-    lat: clamp(p.lat, MLADOST2_BOUNDS.south, MLADOST2_BOUNDS.north),
-    lng: clamp(p.lng, MLADOST2_BOUNDS.west, MLADOST2_BOUNDS.east),
-  };
-}
 
 function migrateV1ToV2(v1: LegacyPercentPositions): Positions {
   const { north, south, east, west } = MLADOST2_BOUNDS;
@@ -65,6 +40,16 @@ function migrateV1ToV2(v1: LegacyPercentPositions): Positions {
     }),
   };
 }
+
+const MAP_INITIAL_CENTER: [number, number] = [42.6449934, 23.3715953];
+const MAP_MIN_ZOOM = 16;
+const MAP_MAX_ZOOM = 19;
+const MAP_INITIAL_ZOOM = MAP_MAX_ZOOM;
+
+const MLADOST2_MAX_BOUNDS: L.LatLngBoundsExpression = [
+  [MLADOST2_BOUNDS.south, MLADOST2_BOUNDS.west],
+  [MLADOST2_BOUNDS.north, MLADOST2_BOUNDS.east],
+];
 
 const CAR_PHOTO: Record<CarId, { src: string }> = {
   me: { src: "/car-me.png" },
@@ -116,8 +101,54 @@ function carIcon(src: string) {
   });
 }
 
-function ParkingMapLeaflet() {
+function otherRole(r: CarId): CarId {
+  return r === "me" ? "partner" : "me";
+}
+
+function resolveInitialRole(): CarId {
+  if (typeof window === "undefined") return "me";
+  try {
+    const u = new URLSearchParams(window.location.search).get("role");
+    if (u === "me" || u === "partner") return u;
+    const s = localStorage.getItem(ROLE_STORAGE_KEY);
+    if (s === "me" || s === "partner") return s;
+  } catch {
+    /* ignore */
+  }
+  return "me";
+}
+
+function ParkingMapLeafletInner() {
+  const searchParams = useSearchParams();
+  const pathname = usePathname();
+  const urlRole = searchParams.get("role");
+
+  const [role, setRole] = useState<CarId>(resolveInitialRole);
   const [positions, setPositions] = useState<Positions>(readStoredPositions);
+  const [syncEnabled, setSyncEnabled] = useState(false);
+  const [partnerUrl, setPartnerUrl] = useState("");
+  const [copyHint, setCopyHint] = useState<string | null>(null);
+
+  const draggingRef = useRef(false);
+  const roleRef = useRef(role);
+  roleRef.current = role;
+
+  useEffect(() => {
+    if (urlRole === "me" || urlRole === "partner") {
+      setRole(urlRole);
+      try {
+        localStorage.setItem(ROLE_STORAGE_KEY, urlRole);
+      } catch {
+        /* ignore */
+      }
+    }
+  }, [urlRole]);
+
+  useEffect(() => {
+    setPartnerUrl(
+      `${typeof window !== "undefined" ? window.location.origin : ""}${pathname || "/"}?role=partner`,
+    );
+  }, [pathname]);
 
   const icons = useMemo(
     () => ({
@@ -128,6 +159,51 @@ function ParkingMapLeaflet() {
   );
 
   useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await fetch("/api/positions", { cache: "no-store" });
+        const data = (await res.json()) as {
+          ok?: boolean;
+          positions?: Positions;
+        };
+        if (!cancelled && res.ok && data.ok && data.positions) {
+          setPositions(data.positions);
+          setSyncEnabled(true);
+        }
+      } catch {
+        /* offline or missing KV — keep local */
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!syncEnabled) return;
+    const t = window.setInterval(async () => {
+      if (draggingRef.current) return;
+      try {
+        const res = await fetch("/api/positions", { cache: "no-store" });
+        const data = (await res.json()) as {
+          ok?: boolean;
+          positions?: Positions;
+        };
+        if (!res.ok || !data.ok || !data.positions) return;
+        const other = otherRole(roleRef.current);
+        setPositions((prev) => ({
+          ...prev,
+          [other]: data.positions![other],
+        }));
+      } catch {
+        /* ignore */
+      }
+    }, 2500);
+    return () => clearInterval(t);
+  }, [syncEnabled]);
+
+  useEffect(() => {
     try {
       localStorage.setItem(STORAGE_KEY_V2, JSON.stringify(positions));
     } catch {
@@ -135,15 +211,59 @@ function ParkingMapLeaflet() {
     }
   }, [positions]);
 
-  const onDragEnd = useCallback((id: CarId, e: L.DragEndEvent) => {
-    const m = e.target;
-    if (!(m instanceof L.Marker)) return;
-    const ll = m.getLatLng();
-    setPositions((p) => ({
-      ...p,
-      [id]: clampToMladost2({ lat: ll.lat, lng: ll.lng }),
-    }));
+  const persistServer = useCallback(
+    async (car: CarId, next: LatLng) => {
+      try {
+        const res = await fetch("/api/positions", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            role: car,
+            lat: next.lat,
+            lng: next.lng,
+          }),
+        });
+        if (res.ok) {
+          setSyncEnabled(true);
+        }
+      } catch {
+        /* ignore */
+      }
+    },
+    [],
+  );
+
+  const onDragStart = useCallback(() => {
+    draggingRef.current = true;
   }, []);
+
+  const onDragEnd = useCallback(
+    (id: CarId, e: L.DragEndEvent) => {
+      draggingRef.current = false;
+      const m = e.target;
+      if (!(m instanceof L.Marker)) return;
+      const ll = m.getLatLng();
+      const next = clampToMladost2({ lat: ll.lat, lng: ll.lng });
+      setPositions((p) => ({
+        ...p,
+        [id]: next,
+      }));
+      void persistServer(id, next);
+    },
+    [persistServer],
+  );
+
+  const copyPartnerLink = useCallback(async () => {
+    if (!partnerUrl) return;
+    try {
+      await navigator.clipboard.writeText(partnerUrl);
+      setCopyHint("Link copied");
+      window.setTimeout(() => setCopyHint(null), 2000);
+    } catch {
+      setCopyHint("Could not copy");
+      window.setTimeout(() => setCopyHint(null), 2000);
+    }
+  }, [partnerUrl]);
 
   return (
     <div className="relative z-0 h-[100dvh] w-full overflow-hidden bg-zinc-200">
@@ -166,14 +286,16 @@ function ParkingMapLeaflet() {
         {(["me", "partner"] as const).map((id) => {
           const p = positions[id];
           const label = id === "me" ? "Your car" : "Partner’s car";
+          const isMine = id === role;
           return (
             <Marker
               key={id}
               position={[p.lat, p.lng]}
-              draggable
+              draggable={isMine}
               icon={icons[id]}
               zIndexOffset={id === "me" ? 200 : 100}
               eventHandlers={{
+                dragstart: onDragStart,
                 dragend: (e) => onDragEnd(id, e),
               }}
               title={label}
@@ -183,35 +305,64 @@ function ParkingMapLeaflet() {
       </MapContainer>
 
       <div className="pointer-events-none absolute inset-0 z-[1000]">
-        <header className="pointer-events-auto absolute left-0 right-0 top-0 z-[1001] flex flex-wrap items-center justify-between gap-2 bg-black/45 px-3 py-2 text-sm text-white backdrop-blur-sm">
-          <span className="font-medium">Where we parked — Mladost 2</span>
-          <div className="flex gap-4 text-xs">
-            <span className="flex items-center gap-1.5">
-              <span className="relative h-5 w-5 overflow-hidden rounded-full border border-black">
-                <Image
-                  src={CAR_PHOTO.me.src}
-                  alt=""
-                  width={40}
-                  height={40}
-                  className="h-full w-full object-cover"
-                  draggable={false}
-                />
+        <header className="pointer-events-auto absolute left-0 right-0 top-0 z-[1001] flex flex-col gap-2 bg-black/45 px-3 py-2 text-sm text-white backdrop-blur-sm">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <span className="font-medium">Where we parked — Mladost 2</span>
+            <div className="flex gap-4 text-xs">
+              <span className="flex items-center gap-1.5">
+                <span className="relative h-5 w-5 overflow-hidden rounded-full border border-black">
+                  <Image
+                    src={CAR_PHOTO.me.src}
+                    alt=""
+                    width={40}
+                    height={40}
+                    className="h-full w-full object-cover"
+                    draggable={false}
+                  />
+                </span>
+                You
               </span>
-              You
-            </span>
-            <span className="flex items-center gap-1.5">
-              <span className="relative h-5 w-5 overflow-hidden rounded-full border border-black">
-                <Image
-                  src={CAR_PHOTO.partner.src}
-                  alt=""
-                  width={40}
-                  height={40}
-                  className="h-full w-full object-cover"
-                  draggable={false}
-                />
+              <span className="flex items-center gap-1.5">
+                <span className="relative h-5 w-5 overflow-hidden rounded-full border border-black">
+                  <Image
+                    src={CAR_PHOTO.partner.src}
+                    alt=""
+                    width={40}
+                    height={40}
+                    className="h-full w-full object-cover"
+                    draggable={false}
+                  />
+                </span>
+                Partner
               </span>
-              Partner
+            </div>
+          </div>
+          <div className="flex flex-wrap items-center gap-2 border-t border-white/20 pt-2 text-xs">
+            <span className="text-white/90">
+              You move:{" "}
+              <strong className="text-white">
+                {role === "me" ? "Your car" : "Partner’s car"}
+              </strong>
+              {syncEnabled ? (
+                <span className="text-emerald-300"> · Synced</span>
+              ) : (
+                <span className="text-amber-200">
+                  · Local only — connect Redis on Vercel to sync
+                </span>
+              )}
             </span>
+            {role === "me" ? (
+              <button
+                type="button"
+                onClick={copyPartnerLink}
+                className="pointer-events-auto rounded bg-white/15 px-2 py-1 text-white hover:bg-white/25"
+              >
+                Copy partner link
+              </button>
+            ) : null}
+            {copyHint ? (
+              <span className="text-emerald-200">{copyHint}</span>
+            ) : null}
           </div>
         </header>
       </div>
@@ -219,7 +370,16 @@ function ParkingMapLeaflet() {
   );
 }
 
-/** Loaded with `next/dynamic` + `ssr: false` in page.tsx so Leaflet never runs on the server. */
 export function ParkingMap() {
-  return <ParkingMapLeaflet />;
+  return (
+    <Suspense
+      fallback={
+        <div className="flex h-[100dvh] w-full items-center justify-center bg-zinc-200 text-zinc-600">
+          Loading map…
+        </div>
+      }
+    >
+      <ParkingMapLeafletInner />
+    </Suspense>
+  );
 }
