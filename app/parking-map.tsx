@@ -1,21 +1,69 @@
 "use client";
 
 import Image from "next/image";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { MapContainer, Marker, TileLayer } from "react-leaflet";
+import L from "leaflet";
+import "leaflet/dist/leaflet.css";
 
 type CarId = "me" | "partner";
 
-const STORAGE_KEY = "parking-map-positions-v1";
+const STORAGE_KEY_V2 = "parking-map-positions-v2";
+const STORAGE_KEY_V1 = "parking-map-positions-v1";
 
-type Positions = Record<CarId, { x: number; y: number }>;
+/** Mladost 2, Sofia — panning is limited to this rectangle. */
+const MLADOST2_BOUNDS = {
+  north: 42.6485,
+  south: 42.6355,
+  east: 23.392,
+  west: 23.362,
+} as const;
 
+/** Where the map first opens — starts at max zoom so the area is as large as allowed. */
+const MAP_INITIAL_CENTER: [number, number] = [42.6449934, 23.3715953];
+const MAP_MIN_ZOOM = 16;
+const MAP_MAX_ZOOM = 19;
+const MAP_INITIAL_ZOOM = MAP_MAX_ZOOM;
+
+const MLADOST2_MAX_BOUNDS: L.LatLngBoundsExpression = [
+  [MLADOST2_BOUNDS.south, MLADOST2_BOUNDS.west],
+  [MLADOST2_BOUNDS.north, MLADOST2_BOUNDS.east],
+];
+
+type LatLng = { lat: number; lng: number };
+type Positions = Record<CarId, LatLng>;
+
+/** Default pins near the initial view (slightly offset so both stay visible). */
 const DEFAULT_POSITIONS: Positions = {
-  me: { x: 30, y: 45 },
-  partner: { x: 70, y: 55 },
+  me: { lat: 42.64485, lng: 23.3714 },
+  partner: { lat: 42.64512, lng: 23.3718 },
 };
+
+type LegacyPercentPositions = Record<CarId, { x: number; y: number }>;
 
 function clamp(n: number, min: number, max: number) {
   return Math.min(max, Math.max(min, n));
+}
+
+function clampToMladost2(p: LatLng): LatLng {
+  return {
+    lat: clamp(p.lat, MLADOST2_BOUNDS.south, MLADOST2_BOUNDS.north),
+    lng: clamp(p.lng, MLADOST2_BOUNDS.west, MLADOST2_BOUNDS.east),
+  };
+}
+
+function migrateV1ToV2(v1: LegacyPercentPositions): Positions {
+  const { north, south, east, west } = MLADOST2_BOUNDS;
+  return {
+    me: clampToMladost2({
+      lat: south + (v1.me.y / 100) * (north - south),
+      lng: west + (v1.me.x / 100) * (east - west),
+    }),
+    partner: clampToMladost2({
+      lat: south + (v1.partner.y / 100) * (north - south),
+      lng: west + (v1.partner.x / 100) * (east - west),
+    }),
+  };
 }
 
 const CAR_PHOTO: Record<CarId, { src: string }> = {
@@ -23,138 +71,120 @@ const CAR_PHOTO: Record<CarId, { src: string }> = {
   partner: { src: "/car-partner.png" },
 };
 
-export function ParkingMap() {
-  const containerRef = useRef<HTMLDivElement>(null);
-  const draggingRef = useRef<CarId | null>(null);
-  const [positions, setPositions] = useState<Positions>(DEFAULT_POSITIONS);
-
-  useEffect(() => {
-    try {
-      const raw = localStorage.getItem(STORAGE_KEY);
-      if (!raw) return;
-      const parsed = JSON.parse(raw) as Positions;
+function readStoredPositions(): Positions {
+  if (typeof window === "undefined") return DEFAULT_POSITIONS;
+  try {
+    const rawV2 = localStorage.getItem(STORAGE_KEY_V2);
+    if (rawV2) {
+      const parsed = JSON.parse(rawV2) as Positions;
+      if (
+        parsed?.me?.lat != null &&
+        parsed?.me?.lng != null &&
+        parsed?.partner?.lat != null &&
+        parsed?.partner?.lng != null
+      ) {
+        return {
+          me: clampToMladost2(parsed.me),
+          partner: clampToMladost2(parsed.partner),
+        };
+      }
+    }
+    const rawV1 = localStorage.getItem(STORAGE_KEY_V1);
+    if (rawV1) {
+      const parsed = JSON.parse(rawV1) as LegacyPercentPositions;
       if (
         parsed?.me?.x != null &&
         parsed?.me?.y != null &&
         parsed?.partner?.x != null &&
         parsed?.partner?.y != null
       ) {
-        setPositions(parsed);
+        return migrateV1ToV2(parsed);
       }
-    } catch {
-      /* ignore */
     }
-  }, []);
+  } catch {
+    /* ignore */
+  }
+  return DEFAULT_POSITIONS;
+}
+
+function carIcon(src: string) {
+  return L.icon({
+    iconUrl: src,
+    iconSize: [56, 56],
+    iconAnchor: [28, 28],
+    className: "rounded-full border-2 border-black shadow-lg",
+  });
+}
+
+function ParkingMapLeaflet() {
+  const [positions, setPositions] = useState<Positions>(readStoredPositions);
+
+  const icons = useMemo(
+    () => ({
+      me: carIcon(CAR_PHOTO.me.src),
+      partner: carIcon(CAR_PHOTO.partner.src),
+    }),
+    [],
+  );
 
   useEffect(() => {
     try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(positions));
+      localStorage.setItem(STORAGE_KEY_V2, JSON.stringify(positions));
     } catch {
       /* ignore */
     }
   }, [positions]);
 
-  const updateFromPointer = useCallback((clientX: number, clientY: number) => {
-    const el = containerRef.current;
-    const id = draggingRef.current;
-    if (!el || !id) return;
-    const rect = el.getBoundingClientRect();
-    const x = clamp(((clientX - rect.left) / rect.width) * 100, 0, 100);
-    const y = clamp(((clientY - rect.top) / rect.height) * 100, 0, 100);
-    setPositions((p) => ({ ...p, [id]: { x, y } }));
+  const onDragEnd = useCallback((id: CarId, e: L.DragEndEvent) => {
+    const m = e.target;
+    if (!(m instanceof L.Marker)) return;
+    const ll = m.getLatLng();
+    setPositions((p) => ({
+      ...p,
+      [id]: clampToMladost2({ lat: ll.lat, lng: ll.lng }),
+    }));
   }, []);
 
-  /** Native listeners (non-passive) — React’s synthetic touch handlers are passive by default. */
-  useEffect(() => {
-    const container = containerRef.current;
-    if (!container) return;
-
-    const pointerDownOpts: AddEventListenerOptions = { passive: false, capture: true };
-    const moveOpts: AddEventListenerOptions = { passive: false, capture: true };
-    const captureOpts: AddEventListenerOptions = { capture: true };
-
-    const findMarker = (target: EventTarget | null): HTMLElement | null => {
-      if (!(target instanceof Element)) return null;
-      return target.closest("[data-car-marker]");
-    };
-
-    const onPointerDown = (e: PointerEvent) => {
-      const marker = findMarker(e.target);
-      if (!marker || !container.contains(marker)) return;
-      const id = marker.getAttribute("data-car-marker") as CarId | null;
-      if (id !== "me" && id !== "partner") return;
-      e.preventDefault();
-      draggingRef.current = id;
-      marker.setPointerCapture(e.pointerId);
-      updateFromPointer(e.clientX, e.clientY);
-    };
-
-    const onPointerMove = (e: PointerEvent) => {
-      if (!draggingRef.current) return;
-      e.preventDefault();
-      updateFromPointer(e.clientX, e.clientY);
-    };
-
-    const endDrag = () => {
-      draggingRef.current = null;
-    };
-
-    const onTouchStart = (e: TouchEvent) => {
-      if (e.touches.length !== 1) return;
-      const marker = findMarker(e.target);
-      if (!marker || !container.contains(marker)) return;
-      const id = marker.getAttribute("data-car-marker") as CarId | null;
-      if (id !== "me" && id !== "partner") return;
-      e.preventDefault();
-      draggingRef.current = id;
-      const t = e.touches[0];
-      updateFromPointer(t.clientX, t.clientY);
-    };
-
-    const onTouchMove = (e: TouchEvent) => {
-      if (!draggingRef.current) return;
-      e.preventDefault();
-      const t = e.touches[0];
-      if (!t) return;
-      updateFromPointer(t.clientX, t.clientY);
-    };
-
-    container.addEventListener("pointerdown", onPointerDown, pointerDownOpts);
-    window.addEventListener("pointermove", onPointerMove, moveOpts);
-    window.addEventListener("pointerup", endDrag, captureOpts);
-    window.addEventListener("pointercancel", endDrag, captureOpts);
-    container.addEventListener("touchstart", onTouchStart, pointerDownOpts);
-    window.addEventListener("touchmove", onTouchMove, moveOpts);
-    window.addEventListener("touchend", endDrag, captureOpts);
-    window.addEventListener("touchcancel", endDrag, captureOpts);
-
-    return () => {
-      container.removeEventListener("pointerdown", onPointerDown, pointerDownOpts);
-      window.removeEventListener("pointermove", onPointerMove, moveOpts);
-      window.removeEventListener("pointerup", endDrag, captureOpts);
-      window.removeEventListener("pointercancel", endDrag, captureOpts);
-      container.removeEventListener("touchstart", onTouchStart, pointerDownOpts);
-      window.removeEventListener("touchmove", onTouchMove, moveOpts);
-      window.removeEventListener("touchend", endDrag, captureOpts);
-      window.removeEventListener("touchcancel", endDrag, captureOpts);
-    };
-  }, [updateFromPointer]);
-
   return (
-    <div
-      ref={containerRef}
-      className="relative h-[100dvh] w-full touch-none overflow-hidden bg-zinc-200"
-    >
-      <img
-        src="/parking-region.png"
-        alt="Parking area map"
-        className="pointer-events-none absolute inset-0 z-0 h-full w-full select-none object-cover object-center"
-        draggable={false}
-      />
+    <div className="relative z-0 h-[100dvh] w-full overflow-hidden bg-zinc-200">
+      <MapContainer
+        center={MAP_INITIAL_CENTER}
+        zoom={MAP_INITIAL_ZOOM}
+        minZoom={MAP_MIN_ZOOM}
+        maxZoom={MAP_MAX_ZOOM}
+        maxBounds={MLADOST2_MAX_BOUNDS}
+        maxBoundsViscosity={1}
+        className="h-full w-full"
+        scrollWheelZoom
+      >
+        <TileLayer
+          attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+          url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
+          maxZoom={MAP_MAX_ZOOM}
+          maxNativeZoom={18}
+        />
+        {(["me", "partner"] as const).map((id) => {
+          const p = positions[id];
+          const label = id === "me" ? "Your car" : "Partner’s car";
+          return (
+            <Marker
+              key={id}
+              position={[p.lat, p.lng]}
+              draggable
+              icon={icons[id]}
+              zIndexOffset={id === "me" ? 200 : 100}
+              eventHandlers={{
+                dragend: (e) => onDragEnd(id, e),
+              }}
+              title={label}
+            />
+          );
+        })}
+      </MapContainer>
 
-      <div className="pointer-events-none absolute inset-0 z-10">
-        <header className="pointer-events-auto absolute left-0 right-0 top-0 z-20 flex flex-wrap items-center justify-between gap-2 bg-black/45 px-3 py-2 text-sm text-white backdrop-blur-sm">
-          <span className="font-medium">Where we parked</span>
+      <div className="pointer-events-none absolute inset-0 z-[1000]">
+        <header className="pointer-events-auto absolute left-0 right-0 top-0 z-[1001] flex flex-wrap items-center justify-between gap-2 bg-black/45 px-3 py-2 text-sm text-white backdrop-blur-sm">
+          <span className="font-medium">Where we parked — Mladost 2</span>
           <div className="flex gap-4 text-xs">
             <span className="flex items-center gap-1.5">
               <span className="relative h-5 w-5 overflow-hidden rounded-full border border-black">
@@ -184,37 +214,12 @@ export function ParkingMap() {
             </span>
           </div>
         </header>
-
-        {(["me", "partner"] as const).map((id) => {
-          const { x, y } = positions[id];
-          const label = id === "me" ? "Your car" : "Partner’s car";
-          return (
-            <div
-              key={id}
-              role="button"
-              tabIndex={0}
-              data-car-marker={id}
-              aria-label={label}
-              title={label}
-              className="pointer-events-auto absolute z-30 h-14 w-14 touch-none cursor-grab overflow-hidden rounded-full border-2 border-black shadow-lg outline-none active:cursor-grabbing"
-              style={{
-                left: `${x}%`,
-                top: `${y}%`,
-                transform: "translate(-50%, -50%)",
-              }}
-            >
-              <Image
-                src={CAR_PHOTO[id].src}
-                alt=""
-                width={128}
-                height={128}
-                className="h-full w-full object-cover"
-                draggable={false}
-              />
-            </div>
-          );
-        })}
       </div>
     </div>
   );
+}
+
+/** Loaded with `next/dynamic` + `ssr: false` in page.tsx so Leaflet never runs on the server. */
+export function ParkingMap() {
+  return <ParkingMapLeaflet />;
 }
