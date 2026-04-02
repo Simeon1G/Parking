@@ -1,5 +1,6 @@
 "use client";
 
+import Image from "next/image";
 import { useCallback, useEffect, useRef, useState } from "react";
 
 type CarId = "me" | "partner";
@@ -17,20 +18,10 @@ function clamp(n: number, min: number, max: number) {
   return Math.min(max, Math.max(min, n));
 }
 
-function CarIcon({ fill }: { fill: string }) {
-  return (
-    <svg
-      viewBox="0 0 24 24"
-      className="h-8 w-8 drop-shadow-md"
-      aria-hidden
-    >
-      <path
-        fill={fill}
-        d="M18.92 6.01C18.72 5.42 18.16 5 17.5 5h-11c-.66 0-1.21.42-1.42 1.01L3 12v8c0 .55.45 1 1 1h1c.55 0 1-.45 1-1v-1h12v1c0 .55.45 1 1 1h1c.55 0 1-.45 1-1v-8l-2.08-5.99zM6.5 16c-.83 0-1.5-.67-1.5-1.5S5.67 13 6.5 13s1.5.67 1.5 1.5S7.33 16 6.5 16zm11 0c-.83 0-1.5-.67-1.5-1.5s.67-1.5 1.5-1.5 1.5.67 1.5 1.5-.67 1.5-1.5 1.5zM5 11l1.5-4.5h11L19 11H5z"
-      />
-    </svg>
-  );
-}
+const CAR_PHOTO: Record<CarId, { src: string }> = {
+  me: { src: "/car-me.png" },
+  partner: { src: "/car-partner.png" },
+};
 
 export function ParkingMap() {
   const containerRef = useRef<HTMLDivElement>(null);
@@ -166,17 +157,29 @@ export function ParkingMap() {
           <span className="font-medium">Where we parked</span>
           <div className="flex gap-4 text-xs">
             <span className="flex items-center gap-1.5">
-              <span
-                className="inline-block h-2.5 w-2.5 rounded-full"
-                style={{ background: "#2563eb" }}
-              />
+              <span className="relative h-5 w-5 overflow-hidden rounded-full border border-black">
+                <Image
+                  src={CAR_PHOTO.me.src}
+                  alt=""
+                  width={40}
+                  height={40}
+                  className="h-full w-full object-cover"
+                  draggable={false}
+                />
+              </span>
               You
             </span>
             <span className="flex items-center gap-1.5">
-              <span
-                className="inline-block h-2.5 w-2.5 rounded-full"
-                style={{ background: "#db2777" }}
-              />
+              <span className="relative h-5 w-5 overflow-hidden rounded-full border border-black">
+                <Image
+                  src={CAR_PHOTO.partner.src}
+                  alt=""
+                  width={40}
+                  height={40}
+                  className="h-full w-full object-cover"
+                  draggable={false}
+                />
+              </span>
               Partner
             </span>
           </div>
@@ -184,7 +187,6 @@ export function ParkingMap() {
 
         {(["me", "partner"] as const).map((id) => {
           const { x, y } = positions[id];
-          const color = id === "me" ? "#2563eb" : "#db2777";
           const label = id === "me" ? "Your car" : "Partner’s car";
           return (
             <div
@@ -194,14 +196,21 @@ export function ParkingMap() {
               data-car-marker={id}
               aria-label={label}
               title={label}
-              className="pointer-events-auto absolute z-30 flex min-h-[48px] min-w-[48px] touch-none cursor-grab items-center justify-center rounded-full border-2 border-white bg-white/90 p-1 shadow-lg outline-none active:cursor-grabbing"
+              className="pointer-events-auto absolute z-30 h-14 w-14 touch-none cursor-grab overflow-hidden rounded-full border-2 border-black shadow-lg outline-none active:cursor-grabbing"
               style={{
                 left: `${x}%`,
                 top: `${y}%`,
                 transform: "translate(-50%, -50%)",
               }}
             >
-              <CarIcon fill={color} />
+              <Image
+                src={CAR_PHOTO[id].src}
+                alt=""
+                width={128}
+                height={128}
+                className="h-full w-full object-cover"
+                draggable={false}
+              />
             </div>
           );
         })}
